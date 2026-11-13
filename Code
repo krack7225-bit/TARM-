@@ -1,0 +1,368 @@
+/+------------------------------------------------------------------+
+//|                                           Trade Management.mq5 |
+//|                                  Copyright 2026, Stanley Mwangi|
+//|                                             https://www.mql5.com 
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2026"
+#property link      "https://www.mql5.com"
+#property version   "1.05"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade tradeExecutor;
+
+//--- Inputs
+input group "--- Streak & Lockout Rules ---"
+input double   InpLossThresholdPct  = 0.45; // Single trade loss threshold (%)
+input int      InpMaxLossStreak     = 2;    // Max consecutive losing trades per week
+input double   InpWinThresholdPct   = 2.00; // Single trade win threshold (%)
+input int      InpMaxWinStreak      = 2;    // Max consecutive winning trades per week
+
+input group "--- Trade Management ---"
+input double   InpMoveToBEPct       = 1.50; // Move SL to BE after this profit (%)
+input double   InpFullTargetPct     = 3.00; // Close full trade at this profit (%)
+
+input group "--- Email Notifications ---"
+input bool     InpEnableEmailAlerts = true; // Enable email alerts
+
+//--- Global Variables
+datetime       g_lastCheckedWeek    = 0;
+bool           g_isLockedOut        = false;
+bool           g_lockoutEmailSent   = false;
+double         g_startingBalance    = 0.0;
+string         g_prefix             = "DG_UI_";
+
+
+//Expert initialization function 
+
+int OnInit()
+{
+   g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_isLockedOut = false;
+   g_lockoutEmailSent = false;
+   g_lastCheckedWeek = GetWeekIdentifier(TimeCurrent());
+   
+   CreateDashboardUI();
+   Print("TARM initialized with Dashboard. Starting Balance: ", g_startingBalance);
+   return(INIT_SUCCEEDED);
+}
+
+
+//Expert deinitialization function
+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, g_prefix);
+   Comment("");
+}
+
+
+//Expert tick function
+
+void OnTick()
+{
+   datetime currentWeek = GetWeekIdentifier(TimeCurrent());
+   
+   if(currentWeek != g_lastCheckedWeek)
+   {
+      g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_isLockedOut = false;
+      g_lockoutEmailSent = false;
+      g_lastCheckedWeek = currentWeek;
+      Print("New trading week detected. Resetting weekly lockout and starting balance to: ", g_startingBalance);
+   }
+   
+   CheckFridayTimeLockout();
+   ManageOpenPositions();
+   
+   int currentLossStreak = 0;
+   int currentWinStreak = 0;
+   EvaluateStreaks(currentLossStreak, currentWinStreak);
+   
+   UpdateDashboardUI(currentLossStreak, currentWinStreak);
+   
+   if(g_isLockedOut)
+   {
+      CloseAllOpenPositions();
+      return;
+   }
+}
+
+
+//Get unique week identifier based on server time
+
+datetime GetWeekIdentifier(datetime time)
+{
+   MqlDateTime dt;
+   TimeToStruct(time, dt);
+   datetime dayEpoch = time - (dt.hour * 3600 + dt.min * 60 + dt.sec);
+   int daysToSubtract = (dt.day_of_week == 0) ? 6 : dt.day_of_week - 1;
+   return dayEpoch - (daysToSubtract * 86400);
+}
+
+
+//Send Email Helper
+
+void SendNotificationEmail(string subject, string message)
+{
+   if(!InpEnableEmailAlerts) return;
+   
+   if(SendMail(subject, message))
+   {
+      Print("Email notification sent successfully: ", subject);
+   }
+   else
+   {
+      Print("Failed to send email. Error code: ", GetLastError());
+   }
+}
+
+
+//Check Friday 12:00 PM UTC+3 (Nairobi Time) Lockout Rule
+
+void CheckFridayTimeLockout()
+{
+   datetime gmtTime = TimeGMT();
+   datetime nairobiTime = gmtTime + (3 * 3600);
+   MqlDateTime dt;
+   TimeToStruct(nairobiTime, dt);
+   
+   if(dt.day_of_week == 5 && dt.hour >= 12)
+   {
+      g_isLockedOut = true;
+      if(!g_lockoutEmailSent)
+      {
+         Print("LOCKOUT TRIGGERED: Friday 12:00 PM UTC+3 time threshold reached.");
+         SendNotificationEmail(
+            "🚨 TARM: ACCOUNT LOCKED OUT (Friday Time Limit)",
+            "Lockout initiated! Friday 12:00 PM UTC+3 (Nairobi Time) threshold has been reached."
+         );
+         g_lockoutEmailSent = true;
+      }
+   }
+}
+
+
+//Evaluate trade history and return current active streaks
+
+void EvaluateStreaks(int &lossStreakOut, int &winStreakOut)
+{
+   lossStreakOut = 0;
+   winStreakOut = 0;
+   
+   if(!HistorySelect(g_lastCheckedWeek, TimeCurrent())) return;
+   
+   int totalDeals = HistoryDealsTotal();
+   int consecutiveLosses = 0;
+   int consecutiveWins = 0;
+   int recentTypes[]; 
+   
+   for(int i = 0; i < totalDeals; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket > 0)
+      {
+         ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_OUT)
+         {
+            datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT) + 
+                            HistoryDealGetDouble(ticket, DEAL_SWAP) + 
+                            HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+                            
+            double singleTradePct = (profit / g_startingBalance) * 100.0;
+            MqlDateTime dealDt;
+            TimeToStruct(dealTime, dealDt);
+            
+            if(dealDt.day_of_week == 4 && singleTradePct >= InpWinThresholdPct)
+            {
+               g_isLockedOut = true;
+               if(!g_lockoutEmailSent)
+               {
+                  Print("LOCKOUT TRIGGERED: Winning trade on Thursday >= 2.0%");
+                  SendNotificationEmail("🚨 TARM: ACCOUNT LOCKED OUT (Thursday Win)", "Yielded >= 2.0% on Thursday.");
+                  g_lockoutEmailSent = true;
+               }
+            }
+            
+            int size = ArraySize(recentTypes);
+            ArrayResize(recentTypes, size + 1);
+            
+            if(singleTradePct <= -InpLossThresholdPct)
+            {
+               consecutiveLosses++;
+               consecutiveWins = 0;
+               recentTypes[size] = -1;
+            }
+            else if(singleTradePct >= InpWinThresholdPct)
+            {
+               consecutiveWins++;
+               consecutiveLosses = 0;
+               recentTypes[size] = 1;
+            }
+            else
+            {
+               consecutiveLosses = 0;
+               consecutiveWins = 0;
+               recentTypes[size] = 0;
+            }
+         }
+      }
+   }
+   
+   lossStreakOut = consecutiveLosses;
+   winStreakOut = consecutiveWins;
+   
+   if(consecutiveLosses >= InpMaxLossStreak || consecutiveWins >= InpMaxWinStreak)
+   {
+      g_isLockedOut = true;
+      if(!g_lockoutEmailSent)
+      {
+         Print("LOCKOUT TRIGGERED: Streak limit reached.");
+         SendNotificationEmail("🚨 TARM: ACCOUNT LOCKED OUT", "Max streak limit reached.");
+         g_lockoutEmailSent = true;
+      }
+   }
+   
+   int totalRecorded = ArraySize(recentTypes);
+   if(totalRecorded >= 3)
+   {
+      int last1 = recentTypes[totalRecorded - 1];
+      int last2 = recentTypes[totalRecorded - 2];
+      int last3 = recentTypes[totalRecorded - 3];
+      
+      if((last1 + last2 + last3) == 0 && (MathAbs(last1) + MathAbs(last2) + MathAbs(last3)) == 2)
+      {
+         g_isLockedOut = true;
+         if(!g_lockoutEmailSent)
+         {
+            Print("LOCKOUT TRIGGERED: Trade Mix Rule (1 Loss, 1 Win, 1 BE).");
+            SendNotificationEmail("🚨 TARM: ACCOUNT LOCKED OUT (Trade Mix)", "Hit 1 Loss, 1 Win, 1 BE mix.");
+            g_lockoutEmailSent = true;
+         }
+      }
+   }
+}
+
+
+//Dashboard UI Creation & Updates
+
+void CreateDashboardUI()
+{
+   ObjectCreate(0, g_prefix + "BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_YDISTANCE, 30);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_XSIZE, 240);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_YSIZE, 160);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_BGCOLOR, clrDarkSlateGray);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_BORDER_COLOR, clrSilver);
+   ObjectSetInteger(0, g_prefix + "BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   CreateTextLabel("Title", "🛡TARM", 35, 40, 10, clrWhite, true);
+   CreateTextLabel("StartBal", "Start Bal: $0.00", 35, 70, 9, clrLightGray, false);
+   CreateTextLabel("LossStreak", "Loss Streak: 0 / 2", 35, 95, 9, clrLightGray, false);
+   CreateTextLabel("WinStreak", "Win Streak: 0 / 2", 35, 120, 9, clrLightGray, false);
+   CreateTextLabel("Status", "Status: NORMAL", 35, 150, 10, clrLime, true);
+}
+
+void CreateTextLabel(string name, string text, int x, int y, int fontSize, color col, bool bold)
+{
+   string objName = g_prefix + name;
+   ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, objName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetString(0, objName, OBJPROP_TEXT, text);
+   ObjectSetString(0, objName, OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetInteger(0, objName, OBJPROP_COLOR, col);
+   if(bold) ObjectSetInteger(0, objName, OBJPROP_STATE, 1);
+}
+
+void UpdateDashboardUI(int lossStreak, int winStreak)
+{
+   ObjectSetString(0, g_prefix + "StartBal", OBJPROP_TEXT, StringFormat("Start Bal: $%.2f", g_startingBalance));
+   ObjectSetString(0, g_prefix + "LossStreak", OBJPROP_TEXT, StringFormat("Loss Streak: %d / %d", lossStreak, InpMaxLossStreak));
+   ObjectSetString(0, g_prefix + "WinStreak", OBJPROP_TEXT, StringFormat("Win Streak: %d / %d", winStreak, InpMaxWinStreak));
+   
+   if(g_isLockedOut)
+   {
+      ObjectSetString(0, g_prefix + "Status", OBJPROP_TEXT, "Status: 🚨 LOCKED OUT");
+      ObjectSetInteger(0, g_prefix + "Status", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, g_prefix + "BG", OBJPROP_BGCOLOR, clrMaroon);
+   }
+   else
+   {
+      ObjectSetString(0, g_prefix + "Status", OBJPROP_TEXT, "Status: NORMAL");
+      ObjectSetInteger(0, g_prefix + "Status", OBJPROP_COLOR, clrLime);
+      ObjectSetInteger(0, g_prefix + "BG", OBJPROP_BGCOLOR, clrDarkSlateGray);
+   }
+   
+   ChartRedraw(0);
+}
+
+
+//Manage open positions for BE and Target Exits
+
+void ManageOpenPositions()
+{
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetSymbol(i) != "" ? PositionGetTicket(i) : 0;
+      if(ticket > 0)
+      {
+         double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+         double sl         = PositionGetDouble(POSITION_SL);
+         double tp         = PositionGetDouble(POSITION_TP);
+         long   type       = PositionGetInteger(POSITION_TYPE);
+         
+         double priceMovePct = 0;
+         if(type == POSITION_TYPE_BUY)
+         {
+            priceMovePct = ((currentPrice - openPrice) / openPrice) * 100.0;
+            if(priceMovePct >= InpMoveToBEPct && (sl < openPrice || sl == 0))
+            {
+               tradeExecutor.PositionModify(ticket, openPrice, tp);
+               SendNotificationEmail("TARM: BE", "SL moved to break-even.");
+            }
+            if(priceMovePct >= InpFullTargetPct)
+            {
+               tradeExecutor.PositionClose(ticket);
+               SendNotificationEmail("TARM: Target Reached", "Trade closed at 3%.");
+            }
+         }
+         else if(type == POSITION_TYPE_SELL)
+         {
+            priceMovePct = ((openPrice - currentPrice) / openPrice) * 100.0;
+            if(priceMovePct >= InpMoveToBEPct && (sl > openPrice || sl == 0))
+            {
+               tradeExecutor.PositionModify(ticket, openPrice, tp);
+               SendNotificationEmail("TARM: BE", "SL moved to break-even.");
+            }
+            if(priceMovePct >= InpFullTargetPct)
+            {
+               tradeExecutor.PositionClose(ticket);
+               SendNotificationEmail("TARM: Target Reached", "Trade closed at 3%.");
+            }
+         }
+      }
+   }
+}
+
+
+//Force close all positions if lockout is active
+
+void CloseAllOpenPositions()
+{
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetSymbol(i) != "" ? PositionGetTicket(i) : 0;
+      if(ticket > 0)
+      {
+         tradeExecutor.PositionClose(ticket);
+      }
+   }
+}
